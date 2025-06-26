@@ -1,13 +1,11 @@
-use std::fmt::Display;
+use servercom::MasterServer;
 use shared::Message;
+use std::fmt::Display;
 
-use tokio::net::{
-    TcpListener, TcpStream,
-    tcp::{OwnedReadHalf, OwnedWriteHalf},
-};
+use tokio::net::TcpListener;
 
 pub async fn send_message(
-    write: &mut OwnedWriteHalf,
+    write: &mut impl AsyncFnMut(net::TaggedPacket) -> anyhow::Result<()>,
     to_client: u64,
     message: &Message,
 ) -> anyhow::Result<()> {
@@ -16,7 +14,7 @@ pub async fn send_message(
         client_id: to_client,
         data: serialized_msg,
     };
-    net::send_tagged_packet(write, packet).await
+    write(packet).await
 }
 
 pub struct Client {
@@ -25,42 +23,22 @@ pub struct Client {
 }
 
 pub struct ChatServer {
-    read: net::FramedReader<OwnedReadHalf>,
-    write: OwnedWriteHalf,
     clients: Vec<Client>,
 }
 
 impl ChatServer {
-    pub fn new(stream: TcpStream) -> Self {
-        let (read, write) = stream.into_split();
-        let read = net::new_framed_reader(read);
+    pub fn new() -> Self {
         Self {
-            read,
-            write,
             clients: Vec::new(),
         }
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
-        loop {
-            let packet = net::recv_tagged_packet(&mut self.read).await?;
-            match packet {
-                net::TaggedPacket::Data { client_id, data } => {
-                    self.handle_data(client_id, data).await?
-                }
-                net::TaggedPacket::Failure { client_id, error } => {
-                    println!("Client {client_id} failed: {error}");
-                    self.clients.retain(|c| c.client_id != client_id);
-                },
-                net::TaggedPacket::Kick { client_id: _ } => unreachable!(),
-                net::TaggedPacket::Reconnection { client_id } => {
-                    println!("Client {} has reconnected", client_id)
-                }
-            }
-        }
-    }
-
-    pub async fn handle_data(&mut self, client_id: u64, data: Vec<u8>) -> anyhow::Result<()> {
+    pub async fn handle_data(
+        &mut self,
+        client_id: u64,
+        data: Vec<u8>,
+        mut send_packet: impl AsyncFnMut(net::TaggedPacket) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let msg: Message = serde_json::from_slice(&data)?;
 
         match msg {
@@ -69,13 +47,12 @@ impl ChatServer {
                 if client.is_none() {
                     println!("Kicking client {client_id}, because they have not logged in");
                     send_message(
-                        &mut self.write,
+                        &mut send_packet,
                         client_id,
                         &make_system_message("You must first log in"),
                     )
                     .await?;
-                    net::send_tagged_packet(&mut self.write, net::TaggedPacket::Kick { client_id })
-                        .await?;
+                    send_packet(net::TaggedPacket::Kick { client_id }).await?;
                     return Ok(());
                 }
                 let client = client.unwrap();
@@ -83,8 +60,7 @@ impl ChatServer {
                 let msg = Message::ChatMessage(format!("<{}> {}", client.name, content));
                 let data = serde_json::to_vec(&msg)?;
                 for client in &self.clients {
-                    net::send_tagged_packet(
-                        &mut self.write,
+                    send_packet(
                         net::TaggedPacket::Data {
                             client_id: client.client_id,
                             data: data.clone(),
@@ -96,15 +72,14 @@ impl ChatServer {
             Message::LoginResponse(name) => {
                 if self.clients.iter().any(|c| c.name == name) {
                     send_message(
-                        &mut self.write,
+                        &mut send_packet,
                         client_id,
                         &make_system_message(
                             "Name already taken. Try again with a different name.",
                         ),
                     )
                     .await?;
-                    net::send_tagged_packet(&mut self.write, net::TaggedPacket::Kick { client_id })
-                        .await?;
+                    send_packet(net::TaggedPacket::Kick { client_id }).await?;
                 } else {
                     self.clients.push(Client { client_id, name });
                 }
@@ -122,6 +97,29 @@ impl ChatServer {
     }
 }
 
+impl MasterServer for ChatServer {
+    async fn handle_packet(
+        &mut self,
+        packet: net::TaggedPacket,
+        send_packet: impl AsyncFnMut(net::TaggedPacket) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        match packet {
+            net::TaggedPacket::Data { client_id, data } => {
+                self.handle_data(client_id, data, send_packet).await?
+            }
+            net::TaggedPacket::Failure { client_id, error } => {
+                println!("Client {client_id} failed: {error}");
+                self.clients.retain(|c| c.client_id != client_id);
+            }
+            net::TaggedPacket::Kick { client_id: _ } => unreachable!(),
+            net::TaggedPacket::Reconnection { client_id } => {
+                println!("Client {} has reconnected", client_id)
+            }
+        }
+        Ok(())
+    }
+}
+
 fn make_system_message(message: impl Display) -> Message {
     Message::ChatMessage(format!("[SYSTEM] {message}"))
 }
@@ -134,9 +132,9 @@ async fn main() -> anyhow::Result<()> {
         let (mut connserver_socket, _) = connserver_listener.accept().await?;
         net::configure_performance_tcp_socket(&mut connserver_socket)?;
 
-        let chat_server = ChatServer::new(connserver_socket);
+        let mut chat_server_core: servercom::ServerCore<Client, ChatServer> = servercom::ServerCore::new(connserver_socket, ChatServer::new())?;
 
-        if let Err(err) = chat_server.run().await {
+        if let Err(err) = chat_server_core.run().await {
             println!("Error: {}", err);
         }
     }
