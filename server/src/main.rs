@@ -1,6 +1,7 @@
-use servercom::MasterServer;
 use shared::Message;
+use voltlane_server::{net, ServerCore};
 use std::fmt::Display;
+use voltlane_server::MasterServer;
 
 use tokio::net::TcpListener;
 
@@ -132,7 +133,7 @@ async fn main() -> anyhow::Result<()> {
         let (mut connserver_socket, _) = connserver_listener.accept().await?;
         net::configure_performance_tcp_socket(&mut connserver_socket)?;
 
-        let mut chat_server_core: servercom::ServerCore<Client, ChatServer> = servercom::ServerCore::new(connserver_socket, ChatServer::new())?;
+        let mut chat_server_core: ServerCore<Client, ChatServer> = ServerCore::new(connserver_socket, ChatServer::new())?;
 
         if let Err(err) = chat_server_core.run().await {
             println!("Error: {}", err);

@@ -1,6 +1,6 @@
-use clientcom::{Connection, net};
 use shared::Message;
-use std::io::{Read, Write};
+use voltlane_client::{net, Connection};
+use std::io::Write;
 use tokio::io::AsyncReadExt as _;
 
 async fn run(client: &mut Connection) -> anyhow::Result<()> {
@@ -33,7 +33,7 @@ async fn run(client: &mut Connection) -> anyhow::Result<()> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let mut client = clientcom::Connection::new("127.0.0.1:42000").await?;
+    let mut client = Connection::new("127.0.0.1:42000").await?;
 
     loop {
         print!("Enter your name: ");
